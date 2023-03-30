@@ -870,7 +870,9 @@ def clean_jaxpr(jaxpr: J, preserve_tags: bool = True) -> J:
   """Runs dead code elimination on a Jaxpr, retaining loss and layer tags."""
   closed_jaxpr = to_closed_jaxpr(jaxpr)
   eqns = []
-  dependants = set(closed_jaxpr.jaxpr.outvars)
+  # TODO: Hack to eliminate "unhashable type 'Literal'" error
+  # dependants = set(closed_jaxpr.jaxpr.outvars)
+  dependants = set([v for v in closed_jaxpr.jaxpr.outvars if not isinstance(v, jax.core.Literal)])
   for eqn in reversed(closed_jaxpr.jaxpr.eqns):
     eqn = apply_to_higher_order_primitives(
         eqn, clean_jaxpr, preserve_tags=preserve_tags)
