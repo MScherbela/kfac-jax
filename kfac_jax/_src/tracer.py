@@ -59,7 +59,10 @@ JaxprOrClosedJaxpr = Union[jax.core.Jaxpr, jax.core.ClosedJaxpr]
 
 def shape_and_type(x: Array) -> Tuple[Shape, jnp.dtype]:
   """Returns the shape and type of the given array."""
-  return x.shape, x.dtype
+  if type(x) == int:
+    return (), int
+  else:
+    return x.shape, x.dtype
 
 
 def make_cache_key(

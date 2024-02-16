@@ -20,11 +20,14 @@ from typing import Callable, Iterator, Optional, Sequence, Any, Generic, Tuple, 
 import jax
 from jax import lax
 import jax.numpy as jnp
+import optax
+
 from kfac_jax._src import curvature_estimator
 from kfac_jax._src import utils
 from typing_extensions import TypeAlias
 
 # Types for annotation
+ArrayTree = utils.ArrayTree
 Array = utils.Array
 PRNGKey = utils.PRNGKey
 Numeric = utils.Numeric
@@ -76,6 +79,7 @@ class Optimizer(utils.WithStagedMethods):
       data_seen: The number of training cases that the optimizer has processed.
       step_counter: An integer giving the current step number :math:`t`.
     """
+    optax_state: ArrayTree
     velocities: Params
     estimator_state: curvature_estimator.BlockDiagonalCurvature.State
     damping: Optional[Array]
@@ -98,6 +102,7 @@ class Optimizer(utils.WithStagedMethods):
       value_func_has_aux: bool = False,
       value_func_has_state: bool = False,
       value_func_has_rng: bool = False,
+      internal_optimizer = None,
       use_adaptive_learning_rate: bool = False,
       learning_rate_schedule: Optional[ScheduleType] = None,
       use_adaptive_momentum: bool = False,
@@ -114,7 +119,12 @@ class Optimizer(utils.WithStagedMethods):
       damping_upper_threshold: Numeric = 0.75,
       always_use_exact_qmodel_for_damping_adjustment: bool = False,
       precon_damping_mult: Numeric = 1.0,
+      norm_constraint_mode = 'fisher_scaled',
       norm_constraint: Optional[Numeric] = None,
+      scale_nc_by_std_dev: bool = False,
+      min_clip_nc: Optional[Numeric] = 3.0,
+      max_clip_nc: Optional[Numeric] = 8.0,
+      scale_by_std_deviation: bool = False,
       num_burnin_steps: int = 10,
       estimation_mode: Optional[str] = None,
       custom_estimator_ctor: Optional[
@@ -405,6 +415,8 @@ class Optimizer(utils.WithStagedMethods):
       raise ValueError("If you are using adaptive damping than "
                        "`damping_schedule` should be None.")
 
+    # Flip input gradients to internal optimizer, because kfac will return param-deltas (~= -gradient)
+    self._internal_optimizer = optax.chain(optax.scale(-1), internal_optimizer or optax.sgd(learning_rate_schedule))
     self._value_and_grad_func = value_and_grad_func
     self._value_func_has_aux = value_func_has_aux
     self._value_func_has_state = value_func_has_state
@@ -450,7 +462,12 @@ class Optimizer(utils.WithStagedMethods):
     self._always_use_exact_qmodel_for_damping_adjustment = (
         always_use_exact_qmodel_for_damping_adjustment)
     self._precon_damping_mult = precon_damping_mult
+    self._norm_constraint_mode = norm_constraint_mode
     self._norm_constraint = norm_constraint
+    self._scale_nc_by_std_dev = scale_nc_by_std_dev
+    self._min_clip_nc = min_clip_nc
+    self._max_clip_nc = max_clip_nc
+    self._scale_by_std_deviation = scale_by_std_deviation
     self._num_burnin_steps = num_burnin_steps
     self._curvature_ema = curvature_ema
     if curvature_update_period > inverse_update_period:
@@ -683,6 +700,7 @@ class Optimizer(utils.WithStagedMethods):
   def _setup_func_args_and_rng(
       self,
       params: Params,
+      static_args: Any,
       rng: PRNGKey,
       batch: Batch,
       func_state: Optional[FuncState],
@@ -702,6 +720,7 @@ class Optimizer(utils.WithStagedMethods):
         params=params,
         func_state=func_state,
         rng=func_rng,
+        static_args=static_args,
         batch=batch,
         has_state=self._value_func_has_state,
         has_rng=self._value_func_has_rng,
@@ -827,6 +846,7 @@ class Optimizer(utils.WithStagedMethods):
       grads: Params,
       coefficient: Optional[Array],
       damping: Array,
+      norm_constraint,
   ) -> Tuple[Params, Optional[Array]]:
     """Computes the preconditioned gradient, maybe applying norm-constraint."""
 
@@ -840,23 +860,34 @@ class Optimizer(utils.WithStagedMethods):
         norm_to_scale_identity_weight_per_block=self._norm_to_scale_identity_weight_per_block,
     )
 
+    norm_constraint_factor = None
     if self._norm_constraint:
-
       assert not self._use_adaptive_learning_rate
       assert coefficient is not None
 
-      sq_norm_grads = utils.inner_product(preconditioned_grads, grads)
+      if self._norm_constraint_mode == 'fisher':
+        sq_norm_grads = utils.inner_product(preconditioned_grads, grads)
+      elif self._norm_constraint_mode == 'fisher_scaled':
+        sq_norm_grads = utils.inner_product(preconditioned_grads, grads)
+        sq_norm_grads = sq_norm_grads * coefficient ** 2
+      elif self._norm_constraint_mode == 'precond_grad':
+        sq_norm_grads = utils.inner_product(preconditioned_grads, preconditioned_grads)
+      elif self._norm_constraint_mode == 'precond_grad_scaled':
+        sq_norm_grads = utils.inner_product(preconditioned_grads, preconditioned_grads)
+        sq_norm_grads = sq_norm_grads * coefficient ** 2
+      else:
+        raise ValueError(f"Unknown norm_constraint_mode: {self._norm_constraint_mode}")
 
-      sq_norm_scaled_grads = sq_norm_grads * coefficient ** 2
+      # We need to sync the norms here, because reduction can be
+      # non-deterministic. They specifically are on GPUs by default for better
+      # performance. Hence although grads and preconditioned_grads are synced,
+      # the inner_product operation can still produce different answers on
+      # different devices.
+      sq_norm_grads = utils.pmean_if_pmap(sq_norm_grads, self.pmap_axis_name)
+      norm_constraint_factor = jnp.sqrt(norm_constraint / sq_norm_grads)
+      preconditioned_grads = utils.scalar_mul(preconditioned_grads, jnp.minimum(norm_constraint_factor, 1))
 
-      max_coefficient = jnp.sqrt(self._norm_constraint / sq_norm_scaled_grads)
-      coefficient = jnp.minimum(max_coefficient, 1)
-
-      preconditioned_grads = utils.scalar_mul(preconditioned_grads, coefficient)
-    else:
-      sq_norm_scaled_grads = None
-
-    return preconditioned_grads, sq_norm_scaled_grads
+    return preconditioned_grads, norm_constraint_factor
 
   def _compute_quad_change_for_damping(
       self,
@@ -960,17 +991,20 @@ class Optimizer(utils.WithStagedMethods):
 
     return damping, rho, new_loss
 
-  @utils.staged
+  # @utils.staged
+  @functools.partial(utils.staged, static_argnums=[2])
   def _init(
       self,
       params: Params,
       rng: PRNGKey,
+      static_args: Any,
       batch: Batch,
       func_state: Optional[FuncState] = None,
   ) -> "Optimizer.State":
     """A staged function to initialize the optimizer state ."""
 
     return Optimizer.State(
+        optax_state=self._internal_optimizer.init(params),
         velocities=jax.tree_util.tree_map(jnp.zeros_like, params),
         estimator_state=self.estimator.init(
             rng=rng,
@@ -978,6 +1012,7 @@ class Optimizer(utils.WithStagedMethods):
                 params=params,
                 func_state=func_state,
                 rng=rng,
+                static_args=static_args,
                 batch=self._batch_process_func(batch),
                 has_state=self._value_func_has_state,
                 has_rng=self._value_func_has_rng,
@@ -997,14 +1032,15 @@ class Optimizer(utils.WithStagedMethods):
       params: Params,
       rng: PRNGKey,
       batch: Batch,
+      static_args: Optional[Any] = None,
       func_state: Optional[FuncState] = None,
   ) -> "Optimizer.State":
     """Initializes the optimizer and returns the appropriate optimizer state."""
 
     if not self.finalized:
-      self.finalize(params, rng, batch, func_state)
+      self.finalize(params, rng, static_args, batch, func_state)
 
-    return self._init(params, rng, batch, func_state)
+    return self._init(params, rng, static_args, batch, func_state)
 
   @functools.partial(utils.staged, donate_argnums=[1, 3, 5])
   def _burnin(
@@ -1065,12 +1101,13 @@ class Optimizer(utils.WithStagedMethods):
 
     return state, func_state
 
-  @functools.partial(utils.staged, donate_argnums=(0, 1, 4))
+  @functools.partial(utils.staged, static_argnums=(2,), donate_argnums=(1, 5))
   @utils.auto_scope_method
   def _step(
       self,
       params: Params,
       state: "Optimizer.State",
+      static_args: any,
       rng: Array,
       batch: Batch,
       func_state: Optional[FuncState],
@@ -1090,7 +1127,7 @@ class Optimizer(utils.WithStagedMethods):
         state.step_counter, state.data_seen)
 
     func_args, rng = self._setup_func_args_and_rng(
-        params, rng, batch, func_state)
+        params, static_args, rng, batch, func_state)
 
     # Update curvature estimate
     state = self._maybe_update_estimator_curvature(
@@ -1116,11 +1153,20 @@ class Optimizer(utils.WithStagedMethods):
     # Update the inverse curvature
     state = self._maybe_update_inverse_cache(state, damping)
 
+    if self._scale_nc_by_std_dev:
+        norm_constraint = jnp.clip(self._norm_constraint / jnp.sqrt(aux['E_var']), self._min_clip_nc, self._max_clip_nc)
+    else:
+        norm_constraint = self._norm_constraint
+
     # Compute proposed directions
-    preconditioned_gradient, sq_norm_scaled_grads = (
-        self._compute_preconditioned_gradient(
-            state, grads, learning_rate, damping)
+    preconditioned_gradient, norm_constraint_factor = (
+        self._compute_preconditioned_gradient(state, grads, learning_rate,
+                                              damping, norm_constraint)
     )
+
+    if self._scale_by_std_deviation:
+      preconditioned_gradient = utils.scalar_mul(preconditioned_gradient, jnp.minimum(1 / jnp.sqrt(aux['E_var']), 1))
+
     vectors = (preconditioned_gradient, state.velocities)
 
     # Compute the coefficients for the vectors
@@ -1135,6 +1181,7 @@ class Optimizer(utils.WithStagedMethods):
 
     # Compute delta and update velocities
     delta = self.weighted_sum_of_objects(vectors, coefficients)
+    delta, state.optax_state = self._internal_optimizer.update(delta, state.optax_state, params)
     state.velocities = delta
 
     # Update parameters
@@ -1181,7 +1228,6 @@ class Optimizer(utils.WithStagedMethods):
         damping=damping,
         rho=rho,
         quad_model_change=quad_model_change,
-        scaled_grad_norm_sq=sq_norm_scaled_grads,
     )
 
     if aux is not None:
@@ -1193,6 +1239,8 @@ class Optimizer(utils.WithStagedMethods):
       stats["grad_norm"] = utils.norm(grads)
       stats["precon_grad_norm"] = utils.norm(preconditioned_gradient)
       stats["update_norm"] = utils.norm(delta)
+      stats["norm_constraint_factor"] = norm_constraint_factor
+      stats["norm_constraint"] = norm_constraint
 
     if self._include_per_param_norms_in_stats:
       stats.update(utils.per_parameter_norm(params, "param_norm"))
@@ -1221,6 +1269,7 @@ class Optimizer(utils.WithStagedMethods):
       self,
       params: Params,
       state: "Optimizer.State",
+      static_args: Any,
       rng: PRNGKey,
       data_iterator: Optional[Iterator[Batch]] = None,
       batch: Optional[Batch] = None,
@@ -1239,6 +1288,7 @@ class Optimizer(utils.WithStagedMethods):
     Args:
       params: The current parameters of the model.
       state: The current state of the optimizer.
+      static_args: Static arguments passed to the (optimized) function
       rng: A Jax PRNG key. Should be different for each iteration and
         each Jax process/host.
       data_iterator: A data iterator to use (if not passing ``batch``).
@@ -1298,7 +1348,7 @@ class Optimizer(utils.WithStagedMethods):
     if data_iterator is not None:
       batch = next(data_iterator)
 
-    return self._step(params, state, rng, batch, func_state,
+    return self._step(params, state, static_args, rng, batch, func_state,
                       learning_rate, momentum, damping)
 
   def compute_l2_quad_matrix(
@@ -1328,6 +1378,9 @@ class Optimizer(utils.WithStagedMethods):
 
     del state
 
+    if func_args is None:
+      raise ValueError("When you have not provided `c_factor_v` you must "
+                       "provide `func_args`.")
     if self.estimator.default_mat_type == "fisher":
       c_factor_v = tuple(self._implicit.multiply_fisher_factor_transpose
                          (func_args, vi) for vi in vectors)
@@ -1554,6 +1607,7 @@ def make_func_args(
     params: Params,
     func_state: Optional[FuncState],
     rng: Optional[PRNGKey],
+    static_args: Any,
     batch: Batch,
     has_state: bool,
     has_rng: bool,
@@ -1570,6 +1624,7 @@ def make_func_args(
     func_state: The function state, if ``has_state`` is ``True``, ``None``
       otherwise.
     rng: The PRNG, if ``has_rng`` is ``True``, ``None`` otherwise.
+    static_args: Static arguments passed to the function
     batch: The batch of data.
     has_state: Whether the function has a function state.
     has_rng: Whether the function uses an rng.
@@ -1583,17 +1638,19 @@ def make_func_args(
   if has_rng and rng is None:
     raise ValueError("`rng=None`, but argument `has_rng=True`.")
 
+  # make sure static_args is always the third returned argument
+  # this is important for filtering static arguments out of jaxpr
   if not has_state and not has_rng:
-    return params, batch
+    return params, batch, static_args
 
   elif not has_rng:
-    return params, func_state, batch
+    return params, func_state, static_args, batch
 
   elif not has_state:
-    return params, rng, batch
+    return params, rng, static_args, batch
 
   else:
-    return params, func_state, rng, batch
+    return params, func_state, static_args, rng, batch
 
 
 def extract_func_outputs(
