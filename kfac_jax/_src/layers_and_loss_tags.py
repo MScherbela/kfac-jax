@@ -17,13 +17,11 @@ from typing import Any, Generic, Optional, Sequence, Type, TypeVar, Tuple, Union
 
 import jax
 from jax import core
-from jax.interpreters import batching as jax_batching
 
 # Types for annotation
 T = TypeVar("T")
 Array = jax.Array
 Arrays = Tuple[Array, ...]
-ArrayOrXla = TypeVar("ArrayOrXla", Array, jax.interpreters.xla.XlaOp)
 
 
 class LossTag(core.Primitive, Generic[T]):
@@ -61,18 +59,20 @@ class LossTag(core.Primitive, Generic[T]):
         inputs to the tag.
     """
     super().__init__(cls.__name__ + "_tag")
+
     self._cls = cls
     self._parameter_dependants = tuple(parameter_dependants)
     self._parameter_independants = tuple(parameter_independants)
 
-    jax.interpreters.xla.register_translation(self, self._xla_translation)
+    jax.interpreters.mlir.register_lowering(self, self._mlir_lowering)
     jax.interpreters.ad.primitive_jvps[self] = self._jvp
+
     # This line defines how does the tag behave under vmap. It is required for
     # any primitive that can be used inside a vmap. The reason why we want to
     # allow this is two fold - one to not break user code when the tags are not
     # used at all, and two - to be able to define a network with code for a
     # single example which is the vmap-ed for a batch.
-    jax_batching.primitive_batchers[self] = self._batching
+    jax.interpreters.batching.primitive_batchers[self] = self._batching
 
   @property
   def parameter_dependants_names(self) -> Tuple[str, ...]:
@@ -93,23 +93,30 @@ class LossTag(core.Primitive, Generic[T]):
       *args: T,
       args_names: Sequence[str],
   ) -> Tuple[T, ...]:
+
     assert len(args) == len(args_names)
+
     arg_map = dict(zip(args_names, args))
+
     return tuple(arg_map[name] for name in self.parameter_dependants_names)
 
   def loss(self, *args: Array, args_names: Sequence[str]) -> T:
     """Constructs an instance of the corresponding :class:`~LossFunction` class."""
+
     assert len(args) == len(args_names)
+
     arg_map = dict(zip(args_names, args))
     return self._cls(**arg_map)
 
   def get_outputs(
       self,
-      *args: ArrayOrXla,
+      *args: Array,
       args_names: Sequence[str],
-  ) -> Tuple[ArrayOrXla, ...]:
+  ) -> Tuple[Array, ...]:
     """Verifies that the number of arguments matches expectations."""
+
     assert len(args) == len(args_names)
+
     return tuple(arg for name, arg in zip(args_names, args)
                  if name in self.parameter_dependants_names)
 
@@ -121,19 +128,20 @@ class LossTag(core.Primitive, Generic[T]):
       *operands: Array,
       args_names: Sequence[str],
   ) -> Tuple[Arrays, jax.core.Effects]:
+
     return (self.get_outputs(*operands, args_names=args_names),
             jax.core.no_effects)
 
-  def _xla_translation(
+  def _mlir_lowering(
       self,
-      xla_context: jax.interpreters.xla.TranslationContext,
-      avals_in: Sequence[core.AbstractValue],
-      avals_out: Sequence[core.AbstractValue],
-      *args: jax.interpreters.xla.XlaOp,
+      context: jax.interpreters.mlir.LoweringRuleContext,
+      *args,
       args_names: Sequence[str],
-  ) -> Tuple[jax.interpreters.xla.XlaOp, ...]:
+  ) -> Tuple[Any, ...]:
     """The XLA translation rule for this primitive (creates a no-op tuple)."""
-    del avals_in, avals_out  # not used
+
+    del context
+
     return self.get_outputs(*args, args_names=args_names)
 
   def _jvp(
@@ -143,10 +151,13 @@ class LossTag(core.Primitive, Generic[T]):
       args_names: Sequence[str],
   ) -> Tuple[Arrays, Arrays]:
     """Computes the Jacobian-vector product for the primitive."""
+
     if len(arg_values) != len(arg_tangents):
       raise ValueError("Values and tangents are not the same length.")
-    primal_output = self.bind(*arg_values, args_names=args_names)
+
+    primal_output = self.bind(*arg_values, args_names=tuple(args_names))
     tangent_output = self.get_outputs(*arg_tangents, args_names=args_names)
+
     return primal_output, tangent_output
 
   def _batching(
@@ -156,7 +167,9 @@ class LossTag(core.Primitive, Generic[T]):
       args_names: Sequence[str],
   ) -> Tuple[Array, Union[int, Tuple[int, ...]]]:
     """Defines how the primitive behaves under :func:`jax.vmap`."""
-    return self.bind(*batched_args, args_names=args_names), batched_dims
+
+    return (self.bind(*batched_args, args_names=tuple(args_names)),
+            batched_dims[:1])
 
 
 class LayerTag(core.Primitive):
@@ -194,7 +207,7 @@ class LayerTag(core.Primitive):
     self._num_outputs = num_outputs
     self._num_inputs = num_inputs
 
-    jax.interpreters.xla.register_translation(self, self._xla_translation)  # pytype: disable=wrong-arg-types  # numpy-scalars
+    jax.interpreters.mlir.register_lowering(self, self._mlir_lowering)  # pytype: disable=wrong-arg-types  # numpy-scalars
     jax.interpreters.ad.deflinear(self, self._transpose)
     jax.interpreters.ad.primitive_transposes[self] = self._transpose
     # This line defines how does the tag behave under vmap. It is required for
@@ -202,7 +215,7 @@ class LayerTag(core.Primitive):
     # allow this is two fold - one to not break user code when the tags are not
     # used at all, and two - to be able to define a network with code for a
     # single example which is the vmap-ed for a batch.
-    jax_batching.primitive_batchers[self] = self._batching
+    jax.interpreters.batching.primitive_batchers[self] = self._batching
 
   @property
   def num_outputs(self) -> int:
@@ -223,10 +236,12 @@ class LayerTag(core.Primitive):
       Tuple[T, ...]
   ]:
     """Splits the operands of the primitive into ``(outputs, inputs, params)``."""
+
     outputs = tuple(all_inputs[:self.num_outputs])
     inputs = tuple(all_inputs[self.num_outputs:self.num_outputs +
                               self.num_inputs])
     params = tuple(all_inputs[self.num_outputs + self.num_inputs:])
+
     return outputs, inputs, params
 
   def get_outputs(self, *operands: Array, **_: Any) -> Array:
@@ -235,16 +250,13 @@ class LayerTag(core.Primitive):
     assert self.num_outputs == len(outputs) == 1
     return outputs[0]
 
-  def _xla_translation(
+  def _mlir_lowering(
       self,
-      xla_context: jax.interpreters.xla.TranslationContext,
-      avals_in: Sequence[core.AbstractValue],
-      avals_out: Sequence[core.AbstractValue],
-      *args: jax.interpreters.xla.XlaOp,
+      context: jax.interpreters.mlir.LoweringRuleContext,
+      *args,
       **_: Any,
-  ) -> Tuple[Array, ...]:
+  ) -> Tuple[Any, ...]:
     """The XLA translation rule for this primitive - returns the ``outputs`` ."""
-    del xla_context, avals_in, avals_out  # not used
     # Need to return a sequence
     return (self.get_outputs(*args),)
 
@@ -285,12 +297,11 @@ def generic_get_outputs(
     *operands: Array,
 ) -> Array:
   """Special logic for generic tag's ``get_outputs``."""
-  # The generic tags have no `inputs` and `outputs` so instead they return just
-  # the parameters.
   assert self.num_inputs == self.num_outputs == 0
   params = self.split_all_inputs(operands)[2]
-  if len(params) != 1:
-    raise ValueError("A generic tag can have only one parameter.")
+
+  # The generic tags have no `inputs` and `outputs` so instead they return just
+  # the first parameter array.
   return params[0]
 
 
@@ -299,9 +310,9 @@ setattr(generic, "get_outputs",
         types.MethodType(generic_get_outputs, generic))
 
 
-def register_generic(parameter: Array) -> Array:
+def register_generic(*parameters: Array) -> Array:
   """Registers a generic tag around the provided parameter array."""
-  return generic.bind(parameter)
+  return generic.bind(*parameters)
 
 
 dense = LayerTag(name="dense_tag", num_inputs=1, num_outputs=1)

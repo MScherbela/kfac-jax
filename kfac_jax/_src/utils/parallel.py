@@ -59,11 +59,20 @@ def wrap_if_pmap(
   return p_func_if_pmap
 
 
-pmean_if_pmap = wrap_if_pmap(lax.pmean)
-psum_if_pmap = wrap_if_pmap(lax.psum)
+# TODO(jamesmartens,botev): We no longer use wrap_if_pmap in the below
+# definitions since it doesn't seem to transmit type info properly. Investigate?
+def pmean_if_pmap(obj: TArrayTree, axis_name: Optional[str]) -> TArrayTree:
 
-compute_mean = jax.pmap(lambda x: lax.pmean(x, "i"), axis_name="i")
-compute_sum = jax.pmap(lambda x: lax.psum(x, "i"), axis_name="i")
+  return lax.pmean(obj, axis_name) if in_pmap(axis_name) else obj
+
+
+def psum_if_pmap(obj: TArrayTree, axis_name: Optional[str]) -> TArrayTree:
+
+  return lax.psum(obj, axis_name) if in_pmap(axis_name) else obj
+
+
+pmap_mean = jax.pmap(lambda x: lax.pmean(x, "i"), axis_name="i")
+pmap_sum = jax.pmap(lambda x: lax.psum(x, "i"), axis_name="i")
 
 
 def index_if_not_scalar(value: Numeric, index: int = 0) -> Numeric:
@@ -90,12 +99,12 @@ def get_first(obj: TArrayTree) -> TArrayTree:
 
 def get_mean(obj: TArrayTree) -> TArrayTree:
   """Returns the average of `obj` over different devices."""
-  return get_first(compute_mean(obj))
+  return get_first(pmap_mean(obj))
 
 
 def get_sum(obj: TArrayTree) -> TArrayTree:
   """Returns the sum of `obj` over different devices."""
-  return get_first(compute_sum(obj))
+  return get_first(pmap_sum(obj))
 
 
 broadcast_all_local_devices = jax.pmap(lambda x: x)
@@ -182,11 +191,10 @@ def sync_and_divide_value(
   return pmean_if_pmap(value, axis_name)
 
 
-jit_sync_and_divide_value = jax.jit(sync_and_divide_value, donate_argnums=0)
+jit_sync_and_divide_value = jax.jit(sync_and_divide_value)
 pmap_sync_and_divide_value = jax.pmap(
     functools.partial(sync_and_divide_value, axis_name="i"),
     axis_name="i",
-    donate_argnums=0,
 )
 
 

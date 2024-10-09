@@ -102,6 +102,8 @@ extensions = [
     'myst_nb',  # This is used for the .ipynb notebooks
 ]
 
+bibtex_bibfiles = []
+
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
@@ -181,10 +183,11 @@ def linkcode_resolve(domain, info):
     source, lineno = inspect.getsourcelines(obj)
   except OSError:
     return None
-
-  return 'https://github.com/deepmind/kfac-jax/tree/master/kfac_jax/%s#L%d#L%d' % (
+  prefix = 'https://github.com/google-deepmind/kfac-jax/tree/master/kfac_jax/'
+  version = '%s#L%d#L%d' % (
       os.path.relpath(filename, start=os.path.dirname(
           kfac_jax.__file__)), lineno, lineno + len(source) - 1)
+  return prefix + version
 
 
 # -- Intersphinx configuration -----------------------------------------------

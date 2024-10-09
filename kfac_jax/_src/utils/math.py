@@ -42,6 +42,13 @@ _ALPHABET = string.ascii_lowercase
 # factors.
 _SPECIAL_CASE_ZERO_INV: bool = True
 
+# Cholesky inverses are deterministic on GPUs and somewhat faster to compute,
+# but tend to perform a bit worse and not tolerate very low damping values.
+# If disabling Cholesky inverses and using GPUs, one must make sure to set
+# distributed_inverses=True, since otherwise the devices can potentially become
+# out of sync, which is a silent and very serious failure
+_USE_CHOLESKY_INVERSION: bool = False
+
 
 def set_special_case_zero_inv(value: bool):
   """Sets whether `pi_adjusted_inverse` handles zero and nan matrices."""
@@ -52,6 +59,17 @@ def set_special_case_zero_inv(value: bool):
 def get_special_case_zero_inv() -> bool:
   """Returns whether `pi_adjusted_inverse` handles zero and nan matrices."""
   return _SPECIAL_CASE_ZERO_INV
+
+
+def set_use_cholesky_inversion(value: bool):
+  """Sets whether `pi_adjusted_inverse` handles zero and nan matrices."""
+  global _USE_CHOLESKY_INVERSION
+  _USE_CHOLESKY_INVERSION = value
+
+
+def get_use_cholesky_inversion() -> bool:
+  """Returns whether `pi_adjusted_inverse` handles zero and nan matrices."""
+  return _USE_CHOLESKY_INVERSION
 
 
 def product(iterable_object: Iterable[TNumeric]) -> TNumeric:
@@ -132,6 +150,10 @@ def weighted_sum_of_objects(
         jnp.add, accumulator, scalar_mul(o_i, c_i))
 
   return accumulator
+
+
+def sum_objects(objects: Sequence[TArrayTree]) -> TArrayTree:
+  return weighted_sum_of_objects(objects, [1] * len(objects))
 
 
 def _inner_product_float64(obj1: ArrayTree, obj2: ArrayTree) -> Array:
@@ -311,6 +333,14 @@ def block_permuted(
   return jnp.block(reordered_blocks)
 
 
+def squared_norm(obj: ArrayTree) -> Array:
+  """Computes the squared Euclidean norm of the provided PyTree object."""
+  elements_squared_norm = jax.tree_util.tree_map(
+      lambda x: jnp.sum(jnp.square(x)), obj)
+
+  return sum(jax.tree_util.tree_leaves(elements_squared_norm))
+
+
 def norm(obj: ArrayTree) -> Array:
   """Computes the Euclidean norm of the provided PyTree object."""
   elements_squared_norm = jax.tree_util.tree_map(
@@ -329,31 +359,62 @@ def per_parameter_norm(obj: ArrayTree, key_prefix: str) -> ArrayTree:
   }
 
 
-def psd_inv_cholesky(matrix: Array) -> Array:
-  """Computes the inverse of `matrix`, with matrix assumed PSD."""
+def psd_inv(matrix: Array) -> Array:
+  """Computes the inverse of `matrix`, which is assumed PSD."""
 
   if matrix.shape[:1] != matrix.shape[1:]:
     raise ValueError(f"Expected square matrix, but got shape {matrix.shape}.")
 
-  identity = jnp.eye(matrix.shape[0], dtype=matrix.dtype)
+  if get_use_cholesky_inversion():
+    identity = jnp.eye(matrix.shape[0], dtype=matrix.dtype)
+    return linalg.solve(matrix, identity, assume_a="pos")
+  else:
+    return linalg.inv(matrix)
 
-  return linalg.solve(matrix, identity, assume_a="pos")
+
+def psd_solve(matrix: Array, vector: Array) -> Array:
+  """Computes the solution of `matrix * x = vector`, for a PSD `matrix`."""
+
+  if matrix.shape[:1] != matrix.shape[1:]:
+    raise ValueError(f"Expected square matrix, but got shape {matrix.shape}.")
+
+  if get_use_cholesky_inversion():
+    return linalg.solve(matrix, vector, assume_a="pos")
+
+  else:
+    return linalg.solve(matrix, vector)
+
+
+def psd_solve_without_last_idx(a: Array, b: Array) -> Array:
+  sub_a = a[..., :-1, :-1]
+  sub_b = b[..., :-1]
+  sub_x = psd_solve(sub_a, sub_b)
+  return jnp.concatenate([sub_x, jnp.zeros_like(b[..., :1])], axis=-1)
+
+
+def psd_solve_maybe_zero_last_idx(a: Array, b: Array) -> Array:
+  # Check the last column and row are zero.
+  check = jnp.logical_and(jnp.all(a[..., -1] == 0), jnp.all(a[..., -1, :] == 0))
+  return jax.lax.cond(check, psd_solve_without_last_idx, psd_solve, a, b)
 
 
 def psd_matrix_norm(
     matrix: Array,
-    norm_type: str = "avg_trace",
+    norm_type: str = "avg_diag",
     method_2norm: str = "lobpcg",
     rng_key: Optional[PRNGKey] = None
-) -> Array:
+) -> Numeric:
   """Computes one of several different matrix norms for PSD matrices.
+
+  NOTE: not all the functions options provided here are actually norms, but most
+  are.
 
   Args:
     matrix: a square matrix represented as a 2D array, a 1D vector giving the
       diagonal, or a 0D scalar (which gets interpreted as a 1x1 matrix). Must be
       positive semi-definite (PSD).
     norm_type: a string specifying the type of matrix norm. Can be "2_norm" for
-      the matrix 2-norm aka the spectral norm, "avg_trace" for the average of
+      the matrix 2-norm aka the spectral norm, "avg_diag" for the average of
       diagonal entries, "1_norm" for the matrix 1-norm, or "avg_fro" for the
       Frobenius norm divided by the square root of the number of rows.
     method_2norm: a string specifying the method used to compute 2-norms. Can
@@ -386,6 +447,7 @@ def psd_matrix_norm(
             matrix, v, m=300, tol=1e-8)[0][0]
 
       elif method_2norm == "power_iteration":
+
         return optax.power_iteration(
             matrix, num_iters=300, error_tolerance=1e-7)[1]
 
@@ -395,7 +457,7 @@ def psd_matrix_norm(
     else:
       raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
 
-  elif norm_type == "avg_trace":
+  elif norm_type == "avg_diag":
 
     if matrix.ndim == 0:
       return matrix
@@ -409,7 +471,65 @@ def psd_matrix_norm(
     else:
       raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
 
-  elif norm_type == "1_norm":
+  elif norm_type == "median_diag":
+
+    if matrix.ndim == 0:
+      return matrix
+
+    elif matrix.ndim == 1:
+      return jnp.median(matrix)
+
+    elif matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+      return jnp.median(jnp.diag(matrix))
+
+    else:
+      raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
+
+  elif norm_type == "trace":
+
+    if matrix.ndim == 0:
+      return matrix
+
+    elif matrix.ndim == 1:
+      return jnp.sum(matrix)
+
+    elif matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+      return jnp.trace(matrix)
+
+    else:
+      raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
+
+  elif norm_type == "median_eig":
+
+    if matrix.ndim == 0:
+      return matrix
+
+    elif matrix.ndim == 1:
+      return jnp.median(matrix)
+
+    elif matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+      # call safe_psd_eigh instead?
+      s, _ = jnp.linalg.eigh(matrix)
+      return jnp.median(s)
+
+    else:
+      raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
+
+  elif norm_type == "one_over_dim":  # this isn't a norm
+
+    if matrix.ndim == 0:
+      return 1.0
+
+    elif matrix.ndim == 1:
+      return 1.0 / matrix.shape[0]
+
+    elif matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+      return 1.0 / matrix.shape[0]
+
+    else:
+      raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
+
+  elif norm_type == "1_norm":  # equiv to inf norm for symmetric matrices
 
     if matrix.ndim == 0:
       return matrix
@@ -437,8 +557,21 @@ def psd_matrix_norm(
     else:
       raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
 
-  else:
-    raise ValueError(f"Unrecognized norm type: '{norm_type}'")
+  elif norm_type == "fro":
+
+    if matrix.ndim == 0:
+      return matrix
+
+    elif matrix.ndim == 1:
+      return jnp.linalg.norm(matrix)
+
+    elif matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+      return jnp.linalg.norm(matrix)
+
+    else:
+      raise ValueError(f"Unsupported shape for factor array: {matrix.shape}")
+
+  raise ValueError(f"Unrecognized norm type: '{norm_type}'")
 
 
 def pi_adjusted_kronecker_factors(
@@ -475,40 +608,61 @@ def pi_adjusted_kronecker_factors(
   # scalar factors `c_i` into a single overall scaling coefficient and
   # distribute the damping to each single non-scalar factor `u_i` equally.
 
-  norm_type = "avg_trace"
+  norm_type = "avg_diag"
 
-  norms = [psd_matrix_norm(f, norm_type=norm_type) for f in factors]
+  norms = jnp.array([psd_matrix_norm(f, norm_type=norm_type) for f in factors])
 
   # Compute the normalized factors `u_i`, such that Trace(u_i) / dim(u_i) = 1
   us = [fi / ni for fi, ni in zip(factors, norms)]
 
-  # kron(arrays) = c * kron(us)
+  k = len(factors)
 
-  c = jnp.prod(jnp.array(norms))
-
-  damping = damping.astype(c.dtype)  # pytype: disable=attribute-error  # numpy-scalars
+  # TODO(jamesmartens,botev): consider making the use of special behavior for
+  # scalar factors a module-level configurable option. One can argue that scalar
+  # factors should behave the same as non-scalar factors for the sake of
+  # consistent behavior as the layer widths shrink to 1.
 
   def regular_case() -> Tuple[Array, ...]:
 
-    non_scalars = sum(1 if f.size != 1 else 0 for f in factors)
+    num_non_scalars = sum(1 if f.size != 1 else 0 for f in factors)
 
-    # We distribute the overall scale over each factor, including scalars
-    if non_scalars == 0:
+    if num_non_scalars != 0:
 
-      # In the case where all factors are scalar we need to add the damping
-      c_k = jnp.power(c + damping, 1.0 / len(factors))
+      # Distribute c and damping/c among k factors, where c = jnp.prod(norms),
+      # satisfying kron(factors) = c * kron(us).
+
+      # NOTE: c_k (geometric mean of norms) can also be calculated by
+      # c ** (1/k) = jnp.prod(norms) ** (1 / len(norms)), but this alternative
+      # can make the result zero due to the multiplication of (potentially)
+      # small values, i.e. jnp.prod(norms).
+      c_k = jnp.exp(jnp.mean(jnp.log(norms)))
+
+      d_k = jnp.power(damping, 1.0 / k) / c_k
+
+      if k > num_non_scalars:
+
+        c_non_scalar = c_k ** (float(k) / num_non_scalars)
+
+        # We distribute the damping only inside the non-scalar factors
+        d_hat = jnp.power(damping, 1.0 / num_non_scalars) / c_non_scalar
+
+      else:
+        d_hat = d_k
 
     else:
-      c_k = jnp.power(c, 1.0 / len(factors))
 
-      # We distribute the damping only inside the non-scalar factors
-      d_hat = jnp.power(damping / c, 1.0 / non_scalars)
+      # This could cause under/overflow, but it's unavoidable here.
+      c = jnp.prod(jnp.array(norms))
+
+      # In the case where all factors are scalar we need to add the damping and
+      # then take the k-th root
+      c_k = jnp.power(c + damping, 1.0 / k)
 
     u_hats = []
 
     for u in us:
 
-      if u.size == 1:
+      if u.size == 1:  # scalar case
         u_hat = jnp.ones_like(u)  # damping not used in the scalar factors
 
       elif u.ndim == 2:
@@ -527,7 +681,7 @@ def pi_adjusted_kronecker_factors(
     # In the special case where for some reason one of the factors is zero, then
     # the we write each factor as `damping^(1/k) * I`.
 
-    c_k = jnp.power(damping, 1.0 / len(factors))
+    c_k = jnp.power(damping, 1.0 / k)
 
     u_hats = []
 
@@ -544,11 +698,7 @@ def pi_adjusted_kronecker_factors(
     return tuple(u_hats)
 
   if get_special_case_zero_inv():
-
-    return lax.cond(
-        jnp.greater(c, 0.0),
-        regular_case,
-        zero_case)
+    return lax.cond(jnp.greater(jnp.min(norms), 0.0), regular_case, zero_case)
 
   else:
     return regular_case()
@@ -573,12 +723,26 @@ def invert_psd_matrices(
   def invert_psd_matrix(m):
 
     if m.ndim == 2:
-      return psd_inv_cholesky(m)
+      return psd_inv(m)
 
     assert m.ndim <= 1
     return 1.0 / m
 
   return jax.tree_map(invert_psd_matrix, matrices)
+
+
+def inverse_sqrt_psd_matrices(matrices: ArrayTree) -> ArrayTree:
+
+  def inverse_sqrt_psd_matrix(m):
+
+    if m.ndim == 2:
+      # Check copy.bara.sky before changing the next line:
+      return qr_pth_inv_root.qr_pth_inv_root(4, m, cholesky_qr=True)
+
+    assert m.ndim <= 1
+    return 1.0 / jnp.sqrt(m)
+
+  return jax.tree_map(inverse_sqrt_psd_matrix, matrices)
 
 
 def pi_adjusted_kronecker_inverse(

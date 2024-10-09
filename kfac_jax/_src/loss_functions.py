@@ -13,7 +13,7 @@
 # limitations under the License.
 """"K-FAC loss functions objects, tags and registration functions."""
 import abc
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Type
 
 import distrax
 import jax
@@ -28,6 +28,7 @@ Numeric = utils.Numeric
 PRNGKey = utils.PRNGKey
 Shape = utils.Shape
 DType = utils.DType
+LossFunctionInputs = Tuple[Array, ...]
 
 
 class LossFunction(utils.Finalizable):
@@ -45,7 +46,7 @@ class LossFunction(utils.Finalizable):
     Args:
       weight: The relative weight attributed to the loss.
     """
-    if not isinstance(weight, (int, float)):
+    if not isinstance(weight, (int, float)) and type(weight) is not object:  # pylint: disable=unidiomatic-typecheck
       if not isinstance(weight, Array) or weight.size > 1:
         raise ValueError("`weight` must be a scalar value.")
     super().__init__()
@@ -86,12 +87,29 @@ class LossFunction(utils.Finalizable):
     """Number of parameter independent arrays of the loss."""
     return len(self.parameter_independants)
 
-  @abc.abstractmethod
   def copy_with_different_inputs(
       self,
       parameter_dependants: Sequence[Array],
   ) -> "LossFunction":
     """Creates a copy of the loss function object, but with different inputs."""
+    array_args, aux = self.tree_flatten()
+    array_args = (tuple(parameter_dependants) +
+                  tuple(array_args[self.num_parameter_dependants:]))
+    return self.tree_unflatten(aux, array_args)
+
+  @abc.abstractmethod
+  def tree_flatten(
+      self,
+  ) -> Tuple[Tuple[Optional[Array], ...], Dict[str, utils.Numeric]]:
+    pass
+
+  @classmethod
+  def tree_unflatten(
+      cls: Type["LossFunction"],
+      aux_data: Dict[str, utils.Numeric],
+      children: Tuple[Optional[Array], ...],
+  ) -> "LossFunction":
+    return cls(*children, **aux_data)  # pytype: disable=not-instantiable
 
   def evaluate(
       self,
@@ -529,6 +547,7 @@ class DistributionNegativeLogProbLoss(NegativeLogProbLoss):
         lambda: self.sample(rng=jax.random.PRNGKey(0))).shape
 
 
+@jax.tree_util.register_pytree_node_class
 class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
                                     NaturalParamsNegativeLogProbLoss):
   """Loss log prob loss for a normal distribution parameterized by a mean vector.
@@ -548,6 +567,7 @@ class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
       targets: Optional[Array] = None,
       variance: Numeric = 0.5,
       weight: Numeric = 1.0,
+      normalize_log_prob: bool = True,
   ):
     """Initializes the loss instance.
 
@@ -556,14 +576,20 @@ class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
       targets: Optional targets to use for evaluation.
       variance: The scalar variance of the normal distribution.
       weight: The relative weight of the loss.
+      normalize_log_prob: Whether the log prob should include the standard
+        normalization constant for Gaussians (which is additive and depends
+        on the variance).
     """
-    if not isinstance(variance, (int, float)):
+
+    if not isinstance(variance, (int, float)) and type(variance) is not object:  # pylint: disable=unidiomatic-typecheck
       if not isinstance(variance, Array) or variance.size > 1:
         raise ValueError("`variance` must be either a python scalar or a "
                          "scalar array.")
     self._mean = mean
     self._targets = targets
     self._variance = variance
+    self._normalize_log_prob = normalize_log_prob
+
     super().__init__(weight=weight)
 
   @property
@@ -579,10 +605,17 @@ class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
     return self._targets
 
   @property
+  def normalize_log_prob(self) -> bool:
+    return self._normalize_log_prob
+
+  @property
   def parameter_independants(self) -> Tuple[Numeric, ...]:
+
     arrays = (self.variance, self.weight)
+
     if self._targets is not None:
       arrays = (self._targets,) + arrays
+
     return arrays
 
   @property
@@ -594,41 +627,26 @@ class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
   def params(self) -> Tuple[Array]:
     return (self.mean,)
 
-  def copy_with_different_inputs(
-      self,
-      parameter_dependants: Sequence[Array],
-  ) -> "NormalMeanNegativeLogProbLoss":
-    """Creates the same :class:`~LossFunction` object, but with different inputs.
+  def _evaluate(self, targets: Array) -> Array:
 
-    Args:
-      parameter_dependants: The inputs to use to the constructor of a class
-        instance. This must be a sequence of length 1.
-
-    Returns:
-      An instance of :class:`~NormalMeanNegativeLogPorLoss` with the provided
-        inputs.
-    Raises:
-      A ValueError if the ``inputs`` is a sequence of different length than 1.
-    """
-    [mean] = parameter_dependants
-    return NormalMeanNegativeLogProbLoss(
-        mean=mean,
-        targets=self._targets,
-        variance=self._variance,
-        weight=self._weight,
-    )
+    if self.normalize_log_prob:
+      return super()._evaluate(targets)
+    else:
+      # keeps leading dims intact
+      return 0.5 * jnp.sum(jnp.square(
+          self.mean - targets), axis=range(1, targets.ndim)) / self.variance
 
   def multiply_fisher_unweighted(
       self,
       vector: Sequence[Array]
   ) -> Tuple[Array]:
-    return (vector[0] / self._variance,)
+    return (vector[0] / self.variance,)
 
   def multiply_fisher_factor_unweighted(
       self,
       vector: Array,
   ) -> Tuple[Array]:
-    return (vector / jnp.sqrt(self._variance),)
+    return (vector / jnp.sqrt(self.variance),)
 
   def multiply_fisher_factor_transpose_unweighted(
       self,
@@ -642,11 +660,18 @@ class NormalMeanNegativeLogProbLoss(DistributionNegativeLogProbLoss,
       index: Sequence[int],
   ) -> Tuple[Array]:
     index = index[0]
-    ones_slice = jnp.ones([self._mean.shape[0]])[..., None]
-    output_slice = ones_slice / jnp.sqrt(self._variance)
-    return (insert_slice_in_zeros(output_slice, 1, self._mean.shape[1], index),)
+    ones_slice = jnp.ones([self.mean.shape[0]])[..., None]
+    output_slice = ones_slice / jnp.sqrt(self.variance)
+    return (insert_slice_in_zeros(output_slice, 1, self.mean.shape[1], index),)
+
+  def tree_flatten(
+      self,
+  ) -> Tuple[Tuple[Array, Optional[Array]], Dict[str, utils.Numeric]]:
+    aux = dict(variance=self.variance, weight=self.weight)
+    return (self.mean, self.targets), aux
 
 
+@jax.tree_util.register_pytree_node_class
 class NormalMeanVarianceNegativeLogProbLoss(DistributionNegativeLogProbLoss):
   """Negative log prob loss for a normal distribution with mean and variance.
 
@@ -708,26 +733,6 @@ class NormalMeanVarianceNegativeLogProbLoss(DistributionNegativeLogProbLoss):
   @property
   def params(self) -> Tuple[Array, Array]:
     return self._mean, self._variance
-
-  def copy_with_different_inputs(
-      self,
-      parameter_dependants: Sequence[Array]
-  ) -> "NormalMeanVarianceNegativeLogProbLoss":
-    """Creates the same :class:`~LossFunction` object, but with different inputs.
-
-    Args:
-      parameter_dependants: The inputs to use to the constructor of a class
-        instance. This must be a sequence of length 2.
-
-    Returns:
-      An instance of :class:`~NormalMeanVarianceNegativeLogProbLoss` with the
-      provided inputs.
-    Raises:
-      A ValueError if the ``inputs`` is a sequence of different length than 2.
-    """
-    [mean, variance] = parameter_dependants
-    return NormalMeanVarianceNegativeLogProbLoss(
-        mean, variance, targets=self._targets, weight=self._weight)
 
   @property
   def _fisher_mean(self) -> Array:
@@ -827,7 +832,14 @@ class NormalMeanVarianceNegativeLogProbLoss(DistributionNegativeLogProbLoss):
   def ggn_factor_inner_shape(self) -> Shape:
     raise NotImplementedError()
 
+  def tree_flatten(
+      self,
+  ) -> Tuple[Tuple[Array, Array, Optional[Array]], Dict[str, utils.Numeric]]:
+    aux = dict(weight=self._weight)
+    return (self._mean, self._variance, self._targets), aux
 
+
+@jax.tree_util.register_pytree_node_class
 class MultiBernoulliNegativeLogProbLoss(DistributionNegativeLogProbLoss,
                                         NaturalParamsNegativeLogProbLoss):
   """Negative log prob loss for multiple Bernoulli distributions parametrized by logits.
@@ -881,14 +893,6 @@ class MultiBernoulliNegativeLogProbLoss(DistributionNegativeLogProbLoss,
   def params(self) -> Tuple[Array]:
     return (self._logits,)
 
-  def copy_with_different_inputs(
-      self,
-      parameter_dependants: Sequence[Array]
-  ) -> "MultiBernoulliNegativeLogProbLoss":
-    [logits] = parameter_dependants
-    return MultiBernoulliNegativeLogProbLoss(
-        logits, targets=self._targets, weight=self._weight)
-
   def multiply_fisher_unweighted(
       self,
       vector: Sequence[Array]
@@ -918,7 +922,14 @@ class MultiBernoulliNegativeLogProbLoss(DistributionNegativeLogProbLoss,
     return (insert_slice_in_zeros(
         output_slice, 1, self._logits.shape[1], index),)
 
+  def tree_flatten(
+      self,
+  ) -> Tuple[Tuple[Array, Optional[Array]], Dict[str, utils.Numeric]]:
+    aux = dict(weight=self._weight)
+    return (self._logits, self._targets), aux
 
+
+@jax.tree_util.register_pytree_node_class
 class CategoricalLogitsNegativeLogProbLoss(DistributionNegativeLogProbLoss,
                                            NaturalParamsNegativeLogProbLoss):
   """Negative log prob loss for a categorical distribution parameterized by logits.
@@ -953,10 +964,10 @@ class CategoricalLogitsNegativeLogProbLoss(DistributionNegativeLogProbLoss,
         dimensions).
       weight: The relative weight of the loss.
     """
-
-    if mask is not None and mask.shape != logits.shape[:1]:
+    if (mask is not None and type(mask) is not object and  # pylint: disable=unidiomatic-typecheck
+        mask.shape != logits.shape[:-1]):
       raise ValueError("If provided, mask.shape must be equal to "
-                       "logits.shape[:1].")
+                       "logits.shape[:-1].")
 
     self._logits = logits
     self._targets = targets
@@ -974,13 +985,13 @@ class CategoricalLogitsNegativeLogProbLoss(DistributionNegativeLogProbLoss,
 
   @property
   def parameter_independants(self) -> Tuple[Numeric, ...]:
-    arrays = (self.weight,)
+    arrays: Tuple[Numeric, ...] = (self.weight,)  # pytype: disable=annotation-type-mismatch
 
     if self.mask is not None:
-      arrays = (self.mask,) + arrays
+      arrays: Tuple[Numeric, ...] = (self.mask,) + arrays  # pytype: disable=annotation-type-mismatch
 
     if self.targets is not None:
-      arrays = (self.targets,) + arrays
+      arrays: Tuple[Numeric, ...] = (self.targets,) + arrays  # pytype: disable=annotation-type-mismatch
 
     return arrays
 
@@ -1023,16 +1034,6 @@ class CategoricalLogitsNegativeLogProbLoss(DistributionNegativeLogProbLoss,
   @property
   def fisher_factor_inner_shape(self) -> Shape:
     return self._logits.shape
-
-  def copy_with_different_inputs(
-      self,
-      parameter_dependants: Sequence[Array]
-  ) -> "CategoricalLogitsNegativeLogProbLoss":
-
-    [logits] = parameter_dependants
-
-    return CategoricalLogitsNegativeLogProbLoss(
-        logits, targets=self.targets, mask=self.mask, weight=self.weight)
 
   def multiply_fisher_unweighted(
       self,
@@ -1083,7 +1084,17 @@ class CategoricalLogitsNegativeLogProbLoss(DistributionNegativeLogProbLoss,
                                          index)
     return (padded_slice - probs * sqrt_probs_slice,)
 
+  def tree_flatten(
+      self,
+  ) -> Tuple[
+      Tuple[Array, Optional[Array], Optional[Array]],
+      Dict[str, utils.Numeric]
+  ]:
+    aux = dict(weight=self._weight)
+    return (self._logits, self._targets, self._mask), aux
 
+
+@jax.tree_util.register_pytree_node_class
 class OneHotCategoricalLogitsNegativeLogProbLoss(
     CategoricalLogitsNegativeLogProbLoss):
   """Neg log prob loss for a categorical distribution with onehot targets.
@@ -1095,14 +1106,6 @@ class OneHotCategoricalLogitsNegativeLogProbLoss(
   @property
   def dist(self) -> distrax.OneHotCategorical:
     return distrax.OneHotCategorical(logits=self._logits, dtype=jnp.int32)
-
-  def copy_with_different_inputs(
-      self,
-      parameter_dependants: Sequence[Array]
-  ) -> "OneHotCategoricalLogitsNegativeLogProbLoss":
-    [logits] = parameter_dependants
-    return OneHotCategoricalLogitsNegativeLogProbLoss(
-        logits, targets=self.targets, mask=self.mask, weight=self.weight)
 
 
 def insert_slice_in_zeros(
@@ -1156,7 +1159,8 @@ def insert_slice_in_zeros(
 NormalMeanNegativeLogProbLoss_tag = tags.LossTag(
     NormalMeanNegativeLogProbLoss,
     parameter_dependants=["mean"],
-    parameter_independants=["targets", "variance", "weight"],
+    parameter_independants=["targets", "variance", "weight",
+                            "normalize_log_prob"],
 )
 
 NormalMeanVarianceNegativeLogProbLoss_tag = tags.LossTag(
@@ -1189,11 +1193,22 @@ def register_normal_predictive_distribution(
     targets: Optional[Array] = None,
     variance: float = 0.5,
     weight: Numeric = 1.0,
+    normalize_log_prob: bool = True,
 ):
   """Registers a normal predictive distribution.
 
   This corresponds to a squared error loss of the form
-     ``weight/(2*var) * ||target - mean||^2``
+     ``weight/(2*var) * jnp.sum((targets - mean)**2) / batch_size``.
+
+  NOTE: this function assumes you are *not* averaging over non-batch dimensions
+  when computing the loss. e.g. if dimension 0 were the batch dimension, this
+  corresponds to
+  ``jnp.mean(jnp.sum((target - prediction)**2,
+                     axis=range(1,target.ndims)), axis=0)``
+  and not
+  ``jnp.mean((target - prediction)**2)``.
+  If your loss is of the latter form you can compensate for it by passing the
+  appropriate value to ``weight``.
 
   Args:
     mean: A tensor defining the mean vector of the distribution. The first
@@ -1203,38 +1218,64 @@ def register_normal_predictive_distribution(
     targets: (OPTIONAL) The targets for the loss function. Only required if
       using ``estimation_mode='fisher_empirical'`` in the optimizer/estimator.
       (Default: None)
-    variance: float. The variance of the distribution. Note that the default
-      value of 0.5 corresponds to a standard squared error loss weight *
-      ||target - prediction||^2. If you want your squared error loss to be of
-      the form ``0.5*coeff*||target - prediction||^2`` you should use
-      variance=1.0.
-      (Default: 0.5)
-    weight: A scalar coefficient to multiply the log prob loss associated with
-      this distribution. The Fisher will be multiplied by the corresponding
-      factor. In general this is NOT equivalent to changing the temperature of
-      the distribution, but in the ase of normal distributions it may be.
-      (Default: 1.0)
+    variance: The variance of the distribution. Must be a constant scalar,
+      independent of the network's parameters. Note that the default value of
+      0.5 corresponds to a standard squared error loss
+      ``weight * jnp.sum((target - prediction)**2)``. If you want your squared
+      error loss to be of the form
+      ``0.5*coeff*jnp.sum((target - prediction)**2)`` you should use
+      variance=1.0. (Default: 0.5)
+    weight: A constant scalar coefficient that the log prob loss associated with
+      this distribution is multiplied by. In general this is NOT equivalent to
+      changing the temperature of the distribution, but in the case of normal
+      distributions it may be. Note that this must be constant and independent
+      of the network's parameters. (Default: 1.0)
+    normalize_log_prob: Whether the negative log prob loss associated to this
+      this distribution should include the additive normalization constant
+      (which is constant and depends on ``variance``) that makes it a true log
+      prob, and not just a squared error loss. Note that this has no effect on
+      the behavior of optimizer with the exception of in niche situations where
+      the loss value is computed from the registrations. e.g., when
+      ``include_registered_loss_in_stats=True`` is used. (Default: True)
   """
   if targets is None:
-    args = [mean, variance, weight]
-    args_names = ["mean", "variance", "weight"]
+    args = [mean, variance, weight, normalize_log_prob]
+    args_names = ["mean", "variance", "weight", "normalize_log_prob"]
   else:
-    args = [mean, targets, variance, weight]
-    args_names = ["mean", "targets", "variance", "weight"]
+    args = [mean, targets, variance, weight, normalize_log_prob]
+    args_names = ["mean", "targets", "variance", "weight", "normalize_log_prob"]
 
-  NormalMeanNegativeLogProbLoss_tag.bind(*args, args_names=args_names)
+  NormalMeanNegativeLogProbLoss_tag.bind(*args, args_names=tuple(args_names))
 
 
 def register_squared_error_loss(
     prediction: Array,
     targets: Optional[Array] = None,
     weight: Numeric = 1.0,
-) -> Array:
+):
   """Registers a squared error loss function.
 
-  This assumes the squared error loss of the form ``||target - prediction||^2``,
-  averaged across the mini-batch. If your loss uses a coefficient of 0.5
-  you need to set the "weight" argument to reflect this.
+  This assumes a squared error loss of the form
+  ``weight * jnp.sum((targets - prediction)**2) / batch_size``.
+
+  If your loss uses a coefficient of 0.5 you need to set the ``weight`` argument
+  to reflect this.
+
+  NOTE: this function assumes you are *not* averaging over non-batch dimensions
+  when computing the loss. e.g. if dimension 0 were the batch dimension, this
+  corresponds to
+  ``jnp.mean(jnp.sum((target - prediction)**2,
+                     axis=range(1, target.ndims)), axis=0)``
+  and not
+  ``jnp.mean((target - prediction)**2)``
+  If your loss is of the latter form you can compensate for it by passing the
+  appropriate value to ``weight``.
+
+  NOTE: even though ``prediction`` and ``targets`` are interchangeable in the
+  definition of the squared error loss, they are not interchangeable in this
+  function. ``prediction`` must be the output of your parameterized function
+  (e.g. neural network), and ``targets`` must not depend on the parameters.
+  Mixing the two up could lead to a silent failure of the curvature estimation.
 
   Args:
     prediction: The prediction made by the network (i.e. its output). The first
@@ -1244,11 +1285,13 @@ def register_squared_error_loss(
     targets: (OPTIONAL) The targets for the loss function. Only required if
       using ``estimation_mode='fisher_empirical'`` in the optimizer/estimator.
       (Default: None)
-    weight: A float coefficient to multiply the loss function by.
-      (Default: 1.0)
+    weight: The constant scalar coefficient which this loss is multiplied by.
+      Note that this must be constant and independent of the network's
+      parameters. (Default: 1.0)
   """
   register_normal_predictive_distribution(
-      prediction, targets, variance=0.5, weight=weight)  # pytype: disable=bad-return-type  # numpy-scalars
+      prediction, targets, variance=0.5,
+      weight=weight, normalize_log_prob=False)
 
 
 def register_multi_bernoulli_predictive_distribution(
@@ -1258,7 +1301,20 @@ def register_multi_bernoulli_predictive_distribution(
 ):
   """Registers a multi-Bernoulli predictive distribution.
 
-  Note that this is distinct from
+  This corresponds to a sigmoid cross-entropy loss of the form
+  ``weight * jnp.sum(sigmoid_cross_entropy(logits, targets)) / batch_size``.
+
+  NOTE: this function assumes you are *not* averaging over non-batch dimensions
+  when computing the loss. e.g. if dimension 0 were the batch dimension, this
+  corresponds to
+  ``jnp.mean(jnp.sum(sigmoid_cross_entropy(logits, targets),
+                     axis=range(1, target.ndims)), axis=0)``
+  and not
+  ``jnp.mean(sigmoid_cross_entropy(logits, targets))``
+  If your loss is of the latter form you can compensate for it by passing the
+  appropriate value to ``weight``.
+
+  NOTE: this is distinct from
   :func:`~register_categorical_predictive_distribution` and should not be
   confused with it.
 
@@ -1270,11 +1326,11 @@ def register_multi_bernoulli_predictive_distribution(
     targets: (OPTIONAL) The targets for the loss function.  Only required if
       using ``estimation_mode='fisher_empirical'`` in the optimizer/estimator.
       (Default: None)
-    weight: (OPTIONAL) a scalar. A coefficient to multiply the log prob loss
-      associated with this distribution. The Fisher will be multiplied by the
-      corresponding factor. This is NOT equivalent to changing the temperature
-      of the distribution since we don't renormalize the log prob in the
-      objective function. (Default: 1.0)
+    weight: The constant scalar coefficient that the log prob loss associated
+      with this distribution is multiplied by. This is NOT equivalent to
+      changing the temperature of the distribution since we don't renormalize
+      the log prob in the objective function. Note that this must be constant
+      and independent of the network's parameters. (Default: 1.0)
   """
   if targets is None:
     args = [logits, weight]
@@ -1283,7 +1339,8 @@ def register_multi_bernoulli_predictive_distribution(
     args = [logits, targets, weight]
     args_names = ["logits", "targets", "weight"]
 
-  MultiBernoulliNegativeLogProbLoss_tag.bind(*args, args_names=args_names)
+  MultiBernoulliNegativeLogProbLoss_tag.bind(
+      *args, args_names=tuple(args_names))
 
 
 def register_sigmoid_cross_entropy_loss(
@@ -1293,10 +1350,24 @@ def register_sigmoid_cross_entropy_loss(
 ):
   """Registers a sigmoid cross-entropy loss function.
 
-  Note that this is distinct from :func:`~register_softmax_cross_entropy_loss`
-  and should not be confused with it. It is similar to
-  :func:`~register_multi_bernoulli_predictive_distribution` but without the
-  explicit probabilistic interpretation. It behaves identically for now.
+  This assumes a sigmoid cross-entropy loss of the form
+  ``weight * jnp.sum(sigmoid_cross_entropy(logits, targets)) / batch_size``.
+
+  NOTE: this function assumes you are *not* averaging over non-batch dimensions
+  when computing the loss. e.g. if dimension 0 were the batch dimension, this
+  corresponds to
+  ``jnp.mean(jnp.sum(sigmoid_cross_entropy(logits, targets),
+                     axis=range(1, target.ndims)), axis=0)``
+  and not
+  ``jnp.mean(sigmoid_cross_entropy(logits, targets))``
+  If your loss is of the latter form you can compensate for this by passing the
+  appropriate value to ``weight``.
+
+  NOTE: this function is distinct from
+  :func:`~register_softmax_cross_entropy_loss` and should not be confused with
+  it. It is similar to :func:`~register_multi_bernoulli_predictive_distribution`
+  but without the explicit probabilistic interpretation. It behaves identically
+  for now.
 
   Args:
     logits: The input logits of the loss as a 2D array of floats. The first
@@ -1307,8 +1378,9 @@ def register_sigmoid_cross_entropy_loss(
       shape as ``logits``. Only required if using
       ``estimation_mode='fisher_empirical'`` in the optimizer/estimator.
       (Default: None)
-    weight: (OPTIONAL) a scalar. A coefficient to multiply the loss function by.
-      (Default: 1.0)
+    weight: The constant scalar coefficient which this loss is multiplied by.
+      Note that this must be constant and independent of the network's
+      parameters. (Default: 1.0)
   """
   register_multi_bernoulli_predictive_distribution(
       logits, targets, weight=weight)
@@ -1322,7 +1394,11 @@ def register_categorical_predictive_distribution(
 ):
   """Registers a categorical predictive distribution.
 
-  Note that this is distinct from
+  This corresponds to a softmax cross-entropy loss of the form
+
+  ``weight * jnp.sum(softmax_cross_entropy(logits, targets)) / batch_size``.
+
+  NOTE: this is distinct from
   :func:`~register_multi_bernoulli_predictive_distribution` and should not be
   confused with it.
 
@@ -1341,11 +1417,11 @@ def register_categorical_predictive_distribution(
       distribution. Should be 0/1-valued and of shape ``(logits.shape[0],)``.
       Log probablities corresponding to mask values of False will be treated
       as constant and equal to 0. (Default: None)
-    weight: (OPTIONAL) a scalar. A coefficient to multiply the
-      log prob loss associated with this distribution. The Fisher will be
-      multiplied by the corresponding factor. This is NOT equivalent to
+    weight: The constant scalar coefficient that the log prob loss associated
+      with this distribution is multiplied by. This is NOT equivalent to
       changing the temperature of the distribution since we don't renormalize
-      the log prob in the objective function. (Default: 1.0)
+      the log prob in the objective function. Note that this must be constant
+      and independent of the network's parameters. (Default: 1.0)
   """
   if targets is not None:
 
@@ -1377,7 +1453,7 @@ def register_categorical_predictive_distribution(
   args = args + [weight]
   args_names = args_names + ["weight"]
 
-  tag_cls.bind(*args, args_names=args_names)
+  tag_cls.bind(*args, args_names=tuple(args_names))
 
 
 def register_softmax_cross_entropy_loss(
@@ -1385,11 +1461,15 @@ def register_softmax_cross_entropy_loss(
     targets: Optional[Array] = None,
     mask: Optional[Array] = None,
     weight: Numeric = 1.0,
-) -> Array:
+):
   """Registers a softmax cross-entropy loss function.
 
-  Note that this is distinct from :func:`~register_sigmoid_cross_entropy_loss`
-  and should not be confused with it. It is similar to
+  This assumes a softmax cross-entropy loss of the form
+
+  ``weight * jnp.sum(softmax_cross_entropy(logits, targets)) / batch_size``.
+
+  NOTE:this is distinct from :func:`~register_sigmoid_cross_entropy_loss` and
+  should not be confused with it. It is similar to
   :func:`~register_categorical_predictive_distribution` but without the explicit
   probabilistic interpretation. It behaves identically for now.
 
@@ -1406,10 +1486,11 @@ def register_softmax_cross_entropy_loss(
     mask: (OPTIONAL) Mask to apply to losses. Should be 0/1-valued and of shape
       ``(logits.shape[0],)``. Losses corresponding to mask values of False will
       be treated as constant and equal to 0. (Default: None)
-    weight: (OPTIONAL) a scalar. A coefficient to multiply the loss function by.
-      (Default: 1.0)
+    weight: The constant scalar coefficient which this loss is multiplied by.
+      Note that this must be constant and independent of the network's
+      parameters. (Default: 1.0)
   """
   register_categorical_predictive_distribution(logits,
                                                targets=targets,
                                                mask=mask,
-                                               weight=weight)  # pytype: disable=bad-return-type  # numpy-scalars
+                                               weight=weight)

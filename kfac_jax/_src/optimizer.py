@@ -118,6 +118,7 @@ class Optimizer(utils.WithStagedMethods):
       damping_lower_threshold: Numeric = 0.25,
       damping_upper_threshold: Numeric = 0.75,
       always_use_exact_qmodel_for_damping_adjustment: bool = False,
+      precon_damping_mult: Numeric = 1.0,
       norm_constraint_mode = 'fisher_scaled',
       norm_constraint: Optional[Numeric] = None,
       scale_nc_by_std_dev: bool = False,
@@ -125,7 +126,9 @@ class Optimizer(utils.WithStagedMethods):
       max_clip_nc: Optional[Numeric] = 8.0,
       scale_by_std_deviation: bool = False,
       num_burnin_steps: int = 10,
-      estimation_mode: str = "fisher_gradients",
+      estimation_mode: Optional[str] = None,
+      custom_estimator_ctor: Optional[
+          Callable[..., curvature_estimator.BlockDiagonalCurvature]] = None,
       curvature_ema: Numeric = 0.95,
       curvature_update_period: int = 1,
       inverse_update_period: int = 5,
@@ -133,6 +136,7 @@ class Optimizer(utils.WithStagedMethods):
       batch_process_func: Optional[Callable[[Batch], Batch]] = None,
       register_only_generic: bool = False,
       patterns_to_skip: Sequence[str] = (),
+      use_automatic_registration: bool = True,
       auto_register_kwargs: Optional[Dict[str, Any]] = None,
       layer_tag_to_block_ctor: Optional[
           Dict[str, curvature_estimator.CurvatureBlockCtor]
@@ -147,12 +151,19 @@ class Optimizer(utils.WithStagedMethods):
       modifiable_attribute_exceptions: Sequence[str] = (),
       include_norms_in_stats: bool = False,
       include_per_param_norms_in_stats: bool = False,
+      include_registered_loss_in_stats: bool = False,
       distributed_precon_apply: bool = True,
       distributed_inverses: bool = True,
+      num_estimator_samples: int = 1,
+      should_vmap_estimator_samples: bool = False,
+      norm_to_scale_identity_weight_per_block: Optional[str] = None,
   ):
     """Initializes the K-FAC optimizer with the provided settings.
 
-    A note on damping:
+    NOTE: Please read the docstring for this constructor carefully. Especially
+    the description of ``value_and_grad_func``.
+
+    A note on the "damping" parameter:
 
     One of the main complications of using second-order optimizers like K-FAC is
     the "damping" parameter. This parameter is multiplied by the identity matrix
@@ -169,27 +180,33 @@ class Optimizer(utils.WithStagedMethods):
     scale of the objective amongst other things.
 
     The optimizer provides a system for adjusting the damping automatically via
-    the ``use_adaptive_damping`` argument, although this system is not
-    completely reliable. Using a fixed value or a manually tuned schedule can
-    work as good or better for some problems, while it can be a very poor choice
-    for others (like deep autoencoders). Empirically we have found that using
-    a fixed value works well enough for common architectures like convnets and
-    transformers.
+    the ``use_adaptive_damping`` argument, although this system is not reliable,
+    especially for highly stochastic objectives. Using a fixed value or a
+    manually tuned schedule can work as good or better for some problems, while
+    it can be a very poor choice for others (like deep autoencoders).
+    Empirically we have found that using a fixed value works well enough for
+    common architectures like convnets and transformers.
 
     Args:
-      value_and_grad_func: Python callable. The function should return the value
-        of the loss to be optimized and its gradients, and optionally the model
-        state and auxiliary information (usually statistics to log). The
-        interface should be: ``out_args, loss_grads =
+      value_and_grad_func: Python callable. This function should return the
+        value of the loss to be optimized and its gradients, and optionally the
+        model state and auxiliary information in the form of a a dict mapping
+        strings to scalar arrays (usually statistics to log). Note that it
+        should *not* be jitted/pmapped or otherwise compiled by JAX, as this can
+        lead to errors. (Compilation is done internally by the optimizer.) The
+        interface of this function should be: ``out_args, loss_grads =
         value_and_grad_func(*in_args)``. Here, ``in_args`` is ``(params,
         func_state, rng, batch)``, with ``rng`` omitted if
         ``value_func_has_rng`` is ``False``, and with ``func_state`` omitted if
         ``value_func_has_state`` is ``False``. Meanwhile, ``out_args`` is
-        ``(loss, func_state, aux)``, with ``func_state`` omitted if
-        ``value_func_has_state`` is ``False``, and with ``aux`` omitted if
-        ``value_func_has_aux`` is ``False``. If both ``value_func_has_state``
-        and ``value_func_has_aux`` are ``False``, ``out_args`` should just be
-        ``loss`` and not ``(loss,)``.
+        ``(loss, (func_state, aux))`` if ``value_func_has_state`` and
+        ``value_func_has_aux`` are both ``True``, ``(loss, func_state)`` if
+        ``value_func_has_state`` is ``True`` and ``value_func_has_aux`` is
+        ``False``, ``(loss, aux)`` if ``value_func_has_state`` is ``False`` and
+        ``value_func_has_aux`` is ``True``, and finally ``loss`` if
+        ``value_func_has_state`` and ``value_func_has_aux`` are both ``False``.
+        This should be consistent with how JAX's ``value_and_grad`` API function
+        is typically used.
       l2_reg: Scalar. Set this value to tell the optimizer what L2
         regularization coefficient you are using (if any). Note the coefficient
         appears in the regularizer as ``coeff / 2 * sum(param**2)``. This adds
@@ -232,9 +249,9 @@ class Optimizer(utils.WithStagedMethods):
         argument. Note that the effectiveness of this technique seems to vary
         between problems. (Default: ``False``)
       damping_schedule: Callable. A schedule for the damping. This should take
-        as input the current step number, and optionally the amount
-        of data seen so far as a keyword argument ``data_seen``, and return a
-        single array that represents the learning rate. (Default: ``None``)
+        as input the current step number, and optionally the amount of data seen
+        so far as a keyword argument ``data_seen``, and return a single array
+        that represents the learning rate. (Default: ``None``)
       initial_damping: Scalar or None. This specifies the initial value of the
         damping that the optimizer will use when using automatic damping
         adaptation. (Default: ``None``)
@@ -268,6 +285,9 @@ class Optimizer(utils.WithStagedMethods):
         which is what this argument controls. When True, the exact curvature
         matrix will be used, which is more expensive, but could possibly produce
         a better damping schedule. (Default: ``False``)
+      precon_damping_mult: Scalar. Multiplies the damping used in the
+        preconditioner (vs the exact quadratic model) by this value.
+        (Default: 1.0)
       norm_constraint: Scalar. If specified, the update is scaled down so that
         its approximate squared Fisher norm ``v^T F v`` is at most the specified
         value. (Note that here ``F`` is the approximate curvature matrix, not
@@ -279,8 +299,13 @@ class Optimizer(utils.WithStagedMethods):
         parameters. (Default: ``10``)
       estimation_mode: String. The type of estimator to use for the curvature
         matrix. See the documentation for :class:`~CurvatureEstimator` for a
-        detailed description of the possible options. (Default:
-        ``fisher_gradients``).
+        detailed description of the possible options. If ``None`` will use
+        default estimation_mode mode of the used CurvatureEstimator subclass,
+        which is typically "fisher_gradients". (Default: ``None``)
+      custom_estimator_ctor: Optional constructor for subclass of
+        :class:`~BlockDiagonalCurvature`. If specified, the optimizer will use
+        this conastructor instead of the default
+        :class:`~BlockDiagonalCurvature`. (Default: ``None``)
       curvature_ema: The decay factor used when calculating the covariance
         estimate moving averages. (Default: ``0.95``)
       curvature_update_period: Int. The number of steps in between updating the
@@ -299,6 +324,8 @@ class Optimizer(utils.WithStagedMethods):
         to automatically pick up any kind of layer tags. (Default: ``False``)
       patterns_to_skip: Tuple. A list of any patterns that should be skipped by
         the graph matcher when auto-tagging. (Default: ``()``)
+      use_automatic_registration: Bool. If ``True``, the optimizer will try to
+        automatically register the layers of your network. (Default: ``True``)
       auto_register_kwargs: Any additional kwargs to be passed down to
         :func:`~auto_register_tags`, which is called by the curvature estimator.
         (Default: ``None``)
@@ -317,7 +344,7 @@ class Optimizer(utils.WithStagedMethods):
         ``kfac.utils.default_batch_size_extractor``)
       pmap_axis_name: String. The name of the pmap axis to use when
         ``multi_device`` is set to True. (Default: ``kfac_axis``)
-      forbid_setting_attributes_after_finalize: Boolean. By default after the
+      forbid_setting_attributes_after_finalize: Boolean. By default, after the
         object is finalized, you can not set any of its properties. This is done
         in order to protect the user from making changes to the object
         attributes that would not be picked up by various internal methods after
@@ -335,16 +362,34 @@ class Optimizer(utils.WithStagedMethods):
         vector norms of the gradient, preconditioned gradient, and parameter
         update are included in the statistics returned by the step function.
         (Default: ``False``)
+      include_registered_loss_in_stats: Boolean. If True, we include the loss,
+        as computed from the registered losses, in the stats. Also included is
+        the relative difference between this as the loss computed from
+        ``value_and_grad_func``. This is useful for debugging registration
+        errors. Note this for this option to work it's required that the targets
+        are passed for each loss function registration. (Default: ``False``)
       distributed_precon_apply: Boolean. Whether to distribute the application
         of the preconditioner across the different devices in a layer-wise
         fashion. If False, each device will (redundantly) perform the required
-        operations for all of the layers. (Default: True)
+        operations for all the layers. (Default: True)
       distributed_inverses: Boolean. Whether to distribute the inverse
         computations (required to compute the preconditioner) across the
         different devices in a layer-wise fashion. If False, each device will
-        (redundantly) perform the required computations for all of the layers.
+        (redundantly) perform the required computations for all the layers.
         (Default: True)
+      num_estimator_samples: Number of samples (per case) to use when computing
+        stochastic curvature matrix estimates. This option is only used when
+        ``estimation_mode == 'fisher_gradients'`` or ``estimation_mode ==
+        '[fisher,ggn]_curvature_prop'``. (Default: 1)
+      should_vmap_estimator_samples: Whether to use ``jax.vmap`` to compute
+        samples when ``num_estimator_samples > 1``. (Default: False)
+      norm_to_scale_identity_weight_per_block: The name of a norm to use to
+        compute extra per-block scaling for the damping. See psd_matrix_norm()
+        in utils/math.py for the definition of these. Note that this will not
+        affect the exact quadratic model that is used as part of the "adaptive"
+        learning rate, momentum, and damping methods. (Default: None)
     """
+
     super().__init__(
         multi_device=multi_device,
         pmap_axis_name=pmap_axis_name if multi_device else None,
@@ -369,6 +414,7 @@ class Optimizer(utils.WithStagedMethods):
     if use_adaptive_damping and damping_schedule is not None:
       raise ValueError("If you are using adaptive damping than "
                        "`damping_schedule` should be None.")
+
     # Flip input gradients to internal optimizer, because kfac will return param-deltas (~= -gradient)
     self._internal_optimizer = optax.chain(optax.scale(-1), internal_optimizer or optax.sgd(learning_rate_schedule))
     self._value_and_grad_func = value_and_grad_func
@@ -377,15 +423,16 @@ class Optimizer(utils.WithStagedMethods):
     self._value_func_has_rng = value_func_has_rng
     self._value_func: ValueFunc = convert_value_and_grad_to_value_func(
         value_and_grad_func,
-        has_aux=value_func_has_aux,
+        has_aux=value_func_has_aux or value_func_has_state,
     )
-    self._l2_reg = jnp.asarray(l2_reg)
+    self._l2_reg = l2_reg
     self._use_adaptive_learning_rate = use_adaptive_learning_rate
     self._learning_rate_schedule = learning_rate_schedule
     self._use_adaptive_momentum = use_adaptive_momentum
 
     if momentum_schedule is not None:
 
+      # TODO(jamesmartens,botev): invesigate if we actually need this anymore.
       def schedule_with_first_step_zero(
           global_step: Array,
           data_seen: Optional[Numeric] = None,
@@ -414,6 +461,7 @@ class Optimizer(utils.WithStagedMethods):
     self._damping_upper_threshold = damping_upper_threshold
     self._always_use_exact_qmodel_for_damping_adjustment = (
         always_use_exact_qmodel_for_damping_adjustment)
+    self._precon_damping_mult = precon_damping_mult
     self._norm_constraint_mode = norm_constraint_mode
     self._norm_constraint = norm_constraint
     self._scale_nc_by_std_dev = scale_nc_by_std_dev
@@ -421,7 +469,6 @@ class Optimizer(utils.WithStagedMethods):
     self._max_clip_nc = max_clip_nc
     self._scale_by_std_deviation = scale_by_std_deviation
     self._num_burnin_steps = num_burnin_steps
-    self._estimation_mode = estimation_mode
     self._curvature_ema = curvature_ema
     if curvature_update_period > inverse_update_period:
       raise ValueError(
@@ -438,26 +485,45 @@ class Optimizer(utils.WithStagedMethods):
     self._batch_process_func = batch_process_func or (lambda x: x)
     self._include_norms_in_stats = include_norms_in_stats
     self._include_per_param_norms_in_stats = include_per_param_norms_in_stats
+    self._include_registered_loss_in_stats = include_registered_loss_in_stats
     self._batch_size_extractor = batch_size_extractor
 
     self._use_cached_inverses = (self._inverse_update_period != 1)
     self._use_exact_inverses = use_exact_inverses
 
+    self._norm_to_scale_identity_weight_per_block = (
+        norm_to_scale_identity_weight_per_block
+    )
+
+    self._params_index = 0
+
+    if (norm_to_scale_identity_weight_per_block is not None
+        and norm_to_scale_identity_weight_per_block != "none"):
+
+      assert (not use_adaptive_learning_rate and not use_adaptive_momentum
+              and not use_adaptive_damping)  # not currently supported
+
+    estimator_ctor = (
+        custom_estimator_ctor or curvature_estimator.BlockDiagonalCurvature)
+
     # Curvature estimator
-    self._estimator = curvature_estimator.BlockDiagonalCurvature(
+    self._estimator = estimator_ctor(
         func=self._value_func,
         default_estimation_mode=estimation_mode,
-        params_index=0,
+        params_index=self._params_index,
         layer_tag_to_block_ctor=layer_tag_to_block_ctor,
         register_only_generic=register_only_generic,
         patterns_to_skip=patterns_to_skip,
         distributed_multiplies=distributed_precon_apply,
         distributed_cache_updates=distributed_inverses,
+        num_samples=num_estimator_samples,
+        should_vmap_samples=should_vmap_estimator_samples,
+        auto_register_tags=use_automatic_registration,
         **(auto_register_kwargs or {}),
     )
     self._implicit = curvature_estimator.ImplicitExactCurvature(
         self._value_func,
-        params_index=0,
+        params_index=self._params_index,
         batch_size_extractor=batch_size_extractor,
     )
 
@@ -472,7 +538,7 @@ class Optimizer(utils.WithStagedMethods):
     return self._num_burnin_steps
 
   @property
-  def l2_reg(self) -> Array:
+  def l2_reg(self) -> Numeric:
     """The weight of the additional diagonal term added to the curvature."""
     return self._l2_reg
 
@@ -694,6 +760,7 @@ class Optimizer(utils.WithStagedMethods):
       sync: Union[Array, bool] = True
   ) -> curvature_estimator.BlockDiagonalCurvature.State:
     """Updates the curvature estimator state."""
+
     state = self.estimator.update_curvature_matrix_estimate(
         state=estimator_state,
         ema_old=ema_old,
@@ -736,15 +803,22 @@ class Optimizer(utils.WithStagedMethods):
   def _compute_loss_and_grads(
       self,
       func_args: FuncArgsVariants,
-  ) -> Tuple[Array, Params, FuncState, FuncAux]:
+      state: Optional["Optimizer.State"] = None,
+  ) -> Tuple[Array, Params, Optional[FuncState], Optional[FuncAux]]:
     """Computes the model loss value and its gradients."""
+
+    del state
 
     out, grads = self._value_and_grad_func(*func_args)
 
     loss, func_state, aux = extract_func_outputs(
         out, self._value_func_has_aux, self._value_func_has_state)
 
-    return loss, grads, func_state, aux
+    if self._include_registered_loss_in_stats:
+      aux = aux or {}
+      aux["loss_registered"] = self.compute_loss_from_registrations(func_args)
+
+    return loss, grads, func_state, aux  # pytype: disable=bad-return-type
 
   def _maybe_update_inverse_cache(
       self,
@@ -779,15 +853,15 @@ class Optimizer(utils.WithStagedMethods):
     preconditioned_grads = self.estimator.multiply_inverse(
         state=state.estimator_state,
         parameter_structured_vector=grads,
-        identity_weight=self.l2_reg + damping,
+        identity_weight=(self.l2_reg + damping) * self._precon_damping_mult,
         exact_power=self._use_exact_inverses,
         use_cached=self._use_cached_inverses,
         pmap_axis_name=self.pmap_axis_name,
+        norm_to_scale_identity_weight_per_block=self._norm_to_scale_identity_weight_per_block,
     )
 
-
     norm_constraint_factor = None
-    if norm_constraint is not None:
+    if self._norm_constraint:
       assert not self._use_adaptive_learning_rate
       assert coefficient is not None
 
@@ -829,7 +903,7 @@ class Optimizer(utils.WithStagedMethods):
 
     if self._always_use_exact_qmodel_for_damping_adjustment:
       quad_model = self.compute_exact_quad_model(
-          [delta], grads, func_args)
+          [delta], grads, func_args, state=state)
     else:
       quad_model = self.compute_approx_quad_model(state, [delta], grads)
 
@@ -844,7 +918,7 @@ class Optimizer(utils.WithStagedMethods):
       learning_rate: Optional[Array],
       momentum: Optional[Array],
       damping: Array,
-      func_args: Optional[FuncArgsVariants] = None,
+      func_args: FuncArgsVariants,
   ) -> Tuple[Tuple[Optional[Array], Optional[Array]], Array]:
     """The correct update coefficients and corresponding quadratic change."""
 
@@ -857,9 +931,10 @@ class Optimizer(utils.WithStagedMethods):
 
     if self._use_adaptive_learning_rate or self._use_adaptive_momentum:
 
-      quad_model = self.compute_exact_quad_model(vectors, grads, func_args)
-
+      quad_model = self.compute_exact_quad_model(vectors, grads, func_args,
+                                                 state=state)
       return self._solve_quad_model(quad_model, damping, vectors, coefficients)
+
     else:
       assert all(c is not None for c in coefficients)
 
@@ -876,7 +951,25 @@ class Optimizer(utils.WithStagedMethods):
       else:
         quad_change = jnp.nan
 
-      return coefficients, quad_change
+      return coefficients, quad_change  # pytype: disable=bad-return-type  # jnp-type
+
+  @utils.staged
+  def compute_loss_from_registrations(
+      self,
+      func_args: FuncArgsVariants
+  ) -> Array:
+
+    loss = self.estimator.compute_func_from_registered(
+        func_args, self._batch_size_extractor(func_args[-1]))
+
+    if self.l2_reg > 0.0:
+
+      l2_reg_val = self.l2_reg / 2 * utils.squared_norm(
+          func_args[self._params_index])
+
+      loss += l2_reg_val
+
+    return loss
 
   @utils.auto_scope_method
   def _update_damping(
@@ -1051,7 +1144,8 @@ class Optimizer(utils.WithStagedMethods):
     del rng  # should not be used after this point!
 
     # Compute loss and gradients
-    loss, grads, func_state, aux = self._compute_loss_and_grads(func_args)
+    loss, grads, func_state, aux = self._compute_loss_and_grads(
+        func_args, state=state)
 
     # Sync
     loss, grads = utils.pmean_if_pmap((loss, grads), self.pmap_axis_name)
@@ -1136,8 +1230,9 @@ class Optimizer(utils.WithStagedMethods):
         quad_model_change=quad_model_change,
     )
 
-    if self._value_func_has_aux:
-      stats["aux"] = utils.pmean_if_pmap(aux, self.pmap_axis_name)
+    if aux is not None:
+      aux = utils.pmean_if_pmap(aux, self.pmap_axis_name)
+      stats["aux"] = aux
 
     if self._include_norms_in_stats:
       stats["param_norm"] = utils.norm(params)
@@ -1155,11 +1250,20 @@ class Optimizer(utils.WithStagedMethods):
       )
       stats.update(utils.per_parameter_norm(delta, "update_norm"))
 
+    if self._include_registered_loss_in_stats:
+      assert aux is not None
+      stats["loss_registered"] = aux.pop("loss_registered")
+      stats["loss_registered_reldiff"] = (
+          stats["loss_registered"] - loss) / loss
+
+    # There seems to be a bug in PyType that is messing up the annotated return
+    # type function this function, causing it to be 'tuple' instead of what it
+    # actually is.
     if self._value_func_has_state:
-      return params, state, func_state, stats
+      return params, state, func_state, stats  # pytype: disable=bad-return-type
     else:
       assert func_state is None
-      return params, state, stats
+      return params, state, stats  # pytype: disable=bad-return-type
 
   def step(
       self,
@@ -1176,6 +1280,10 @@ class Optimizer(utils.WithStagedMethods):
       global_step_int: Optional[int] = None
   )-> ReturnEither:
     """Performs a single update step using the optimizer.
+
+    NOTE: please do not jit/pmap or otherwise compile this function with JAX,
+    as this can lead to errors. Compilation is handled internally by the
+    optimizer.
 
     Args:
       params: The current parameters of the model.
@@ -1263,9 +1371,13 @@ class Optimizer(utils.WithStagedMethods):
       self,
       vectors: Sequence[Params],
       grads: Params,
-      func_args: Optional[FuncArgsVariants] = None,
+      func_args: FuncArgsVariants,
+      state: Optional["Optimizer.State"] = None,
   ) -> Tuple[Array, Array, Array]:
     """Computes the components of the exact quadratic model."""
+
+    del state
+
     if func_args is None:
       raise ValueError("When you have not provided `c_factor_v` you must "
                        "provide `func_args`.")
@@ -1302,6 +1414,7 @@ class Optimizer(utils.WithStagedMethods):
           exact_power=True,
           use_cached=False,
           pmap_axis_name=self.pmap_axis_name,
+          norm_to_scale_identity_weight_per_block=self._norm_to_scale_identity_weight_per_block,
       )
 
     c_vectors = [c_times_v(v_i) for v_i in vectors]
@@ -1393,20 +1506,13 @@ class Optimizer(utils.WithStagedMethods):
       if len(fixed_coefficients) == 1:
         # This special case arises at the first iteration, because all
         # velocities are zeros.
-
         special_case = jnp.logical_and(A_damped[0, 0] == 0, b[0] == 0)
         w = - lax.cond(special_case, lambda: b, lambda: b / A_damped[0])
 
       elif len(fixed_coefficients) == 2:
         # This special case arises at the first iteration, because all
         # velocities are zeros.
-
-        to_check = jnp.asarray([A_damped[0, 1], A_damped[1, 0],
-                                A_damped[1, 1], b[1]])
-
-        w = - lax.cond(jnp.all(to_check == 0),
-                       lambda: jnp.stack([b[0] / A_damped[0, 0], b[1]]),
-                       lambda: jnp.linalg.solve(A_damped, b))
+        w = - utils.psd_solve_maybe_zero_last_idx(A_damped, b)
       else:
         raise NotImplementedError()
 
@@ -1489,8 +1595,9 @@ def convert_value_and_grad_to_value_func(
   Returns:
     A function that returns only the loss value.
   """
-  def value_func(*args) -> Array:
-    out, _ = value_and_grad_func(*args)
+
+  def value_func(*args, **kwargs) -> Array:
+    out, _ = value_and_grad_func(*args, **kwargs)
     return out[0] if has_aux else out
 
   return value_func
@@ -1565,6 +1672,7 @@ def extract_func_outputs(
   """
 
   if not has_aux and not has_state:
+    assert isinstance(raw_outputs, Array)
     return raw_outputs, None, None
 
   loss, other = raw_outputs

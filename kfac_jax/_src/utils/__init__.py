@@ -68,8 +68,8 @@ in_pmap = parallel.in_pmap
 wrap_if_pmap = parallel.wrap_if_pmap
 pmean_if_pmap = parallel.pmean_if_pmap
 psum_if_pmap = parallel.psum_if_pmap
-compute_mean = parallel.compute_mean
-compute_sum = parallel.compute_sum
+pmap_mean = parallel.pmap_mean
+pmap_sum = parallel.pmap_sum
 index_if_not_scalar = parallel.index_if_not_scalar
 get_first = parallel.get_first
 get_mean = parallel.get_mean
@@ -96,19 +96,25 @@ del parallel
 # math
 set_special_case_zero_inv = math.set_special_case_zero_inv
 get_special_case_zero_inv = math.get_special_case_zero_inv
+set_use_cholesky_inversion = math.set_use_cholesky_inversion
+get_use_cholesky_inversion = math.get_use_cholesky_inversion
 product = math.product
 outer_product = math.outer_product
 scalar_mul = math.scalar_mul
 scalar_div = math.scalar_div
 weighted_sum_of_objects = math.weighted_sum_of_objects
+sum_of_objects = math.sum_objects
 inner_product = math.inner_product
 symmetric_matrix_inner_products = math.symmetric_matrix_inner_products
 matrix_of_inner_products = math.matrix_of_inner_products
 vector_of_inner_products = math.vector_of_inner_products
 block_permuted = math.block_permuted
 norm = math.norm
+squared_norm = math.squared_norm
 per_parameter_norm = math.per_parameter_norm
-psd_inv_cholesky = math.psd_inv_cholesky
+psd_inv = math.psd_inv
+psd_solve = math.psd_solve
+psd_solve_maybe_zero_last_idx = math.psd_solve_maybe_zero_last_idx
 pi_adjusted_kronecker_factors = math.pi_adjusted_kronecker_factors
 pi_adjusted_kronecker_inverse = math.pi_adjusted_kronecker_inverse
 kronecker_product_axis_mul_v = math.kronecker_product_axis_mul_v
@@ -118,6 +124,9 @@ kronecker_eigen_basis_mul_v = math.kronecker_eigen_basis_mul_v
 safe_psd_eigh = math.safe_psd_eigh
 loop_and_parallelize_average = math.loop_and_parallelize_average
 psd_matrix_norm = math.psd_matrix_norm
+invert_psd_matrices = math.invert_psd_matrices
+inverse_sqrt_psd_matrices = math.inverse_sqrt_psd_matrices
+
 del math
 
 # accumulators

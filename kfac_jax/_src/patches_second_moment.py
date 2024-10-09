@@ -107,7 +107,7 @@ class _ConvSpec:
     """Creates a shape according to this layout specification."""
     if len(spatial_dims) != len(self.order) - 2:
       raise ValueError("Incorrect number of spatial dimensions.")
-    result: List[T] = [None] * len(self)
+    result: List[T] = [None] * len(self)  # pytype: disable=annotation-type-mismatch
     result[self.n_axis] = n
     result[self.c_axis] = c
     for ax, dim in zip(self.spatial_axes, spatial_dims):
@@ -628,7 +628,7 @@ def patches_moments_explicit(
       else:
         wf_n = weighting_array[in_spec.n_axis]
         wf_spatial = [weighting_array.shape[a] for a in in_spec.spatial_axes]
-        wf_sizes = in_spec.create_shape(wf_n, jnp.ones([]), *wf_spatial)
+        wf_sizes = in_spec.create_shape(wf_n, jnp.ones([]), *wf_spatial)  # pytype: disable=wrong-arg-types  # jnp-type
         wf_i = _slice_array(weighting_array, index, wf_sizes)
     else:
       wf_i = None
